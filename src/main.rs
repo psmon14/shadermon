@@ -60,7 +60,7 @@ fn main() {
     let progress_clone = Arc::clone(&current_progress);
     std::thread::spawn(move || {
         let progress_re = Regex::new(r"Still replaying (\d+)\s+\((\d+)%,\s+(\d+)/(\d+)\)").unwrap();
-        let done_re = Regex::new(r"Done with replay").unwrap();
+        let done_re = Regex::new(r"Destroyed compile job (\d+)").unwrap();
         let mut last_checked_len = 0;
 
         loop {
@@ -96,7 +96,12 @@ fn main() {
                                     total,
                                     is_active: true,
                                 };
-                            } else if done_re.is_match(&last_line) {
+                            } else if let Some(done_caps) = done_re.captures(&last_line) {
+                                let app_id = done_caps.get(1).unwrap().as_str().to_string();
+                                let app_name = app_cache.entry(app_id.clone()).or_insert_with(|| {
+                                    resolve_app_name(&steamapps_path, &app_id)
+                                }).clone();
+                                
                                 if lock.is_active && !lock.app_name.is_empty() {
                                     let _ = Notification::new()
                                         .summary("Steam Shader Monitor")
