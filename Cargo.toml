@@ -1,0 +1,12 @@
+[package]
+name = "shadermon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tray-icon = "0.19"
+glib = "0.18"
+gtk = "0.18"
+regex = "1.10"
+dirs = "5.0"
+image = "0.24"
