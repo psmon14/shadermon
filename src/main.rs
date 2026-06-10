@@ -1,4 +1,5 @@
 use dirs::home_dir;
+use notify_rust::Notification;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs::File;
@@ -46,14 +47,14 @@ fn main() {
         eprintln!("Warning: Failed to decode embedded icon. Falling back to blank canvas.");
         Icon::from_rgba(vec![128; 16 * 16 * 4], 16, 16).unwrap()
     });
-
+    
     let mut tray_icon = Some(
         TrayIconBuilder::new()
-        .with_menu(Box::new(tray_menu))
-        .with_tooltip("Steam Shader Progress")
-        .with_icon(icon)
-        .build()
-        .unwrap(),
+            .with_menu(Box::new(tray_menu))
+            .with_tooltip("Steam Shader Progress")
+            .with_icon(icon)
+            .build()
+            .unwrap(),
     );
 
     let progress_clone = Arc::clone(&current_progress);
@@ -70,10 +71,10 @@ fn main() {
                     if len != last_checked_len {
                         last_checked_len = len;
                         let reader = BufReader::new(file);
-
+                        
                         if let Some(last_line) = reader.lines().filter_map(Result::ok).last() {
                             let mut lock = progress_clone.lock().unwrap();
-
+                            
                             if let Some(caps) = progress_re.captures(&last_line) {
                                 let app_id = caps.get(1).unwrap().as_str().to_string();
                                 let percent_raw = caps.get(2).unwrap().as_str();
@@ -96,9 +97,19 @@ fn main() {
                                     is_active: true,
                                 };
                             } else if done_re.is_match(&last_line) {
+                                if lock.is_active && !lock.app_name.is_empty() {
+                                    let _ = Notification::new()
+                                        .summary("Steam Shader Monitor")
+                                        .body(&format!("Finished compiling shaders for:\n{}", lock.app_name))
+                                        .appname("shadermon")
+                                        .icon("steam") //Should pull steam icon, i think?
+                                        .timeout(Duration::from_secs(5))
+                                        .show();
+                                }
+
                                 *lock = ShaderProgress {
                                     is_active: false,
-                       ..Default::default()
+                                    ..Default::default()
                                 };
                             }
                         }
@@ -118,8 +129,8 @@ fn main() {
             if data.is_active {
                 let bar = make_progress_bar(data.percent_num);
                 let text = format!(
-                    "{} \n{} {} ( {}/{} )",
-                                   data.app_name, bar, data.percent_str, data.compiled, data.total
+                    "{} \n{} {} ( {}/{} )", 
+                    data.app_name, bar, data.percent_str, data.compiled, data.total
                 );
                 progress_item_clone.set_text(text);
             } else {
@@ -133,7 +144,7 @@ fn main() {
     glib::timeout_add_local(Duration::from_millis(100), move || {
         if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             if event.id == quit_item.id() {
-                let _ = tray_icon.take();
+                let _ = tray_icon.take(); 
                 main_loop_clone.quit();
             }
         }
@@ -147,10 +158,10 @@ fn make_progress_bar(percent: u32) -> String {
     let total_blocks = 10;
     let filled_blocks = ((percent as f32 / 100.0) * total_blocks as f32).round() as usize;
     let empty_blocks = total_blocks - filled_blocks;
-
+    
     let filled = "█".repeat(filled_blocks);
     let empty = "░".repeat(empty_blocks);
-
+    
     format!("[{}{}]", filled, empty)
 }
 
