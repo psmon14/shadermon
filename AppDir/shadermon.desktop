@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Steam Shader Monitor
+Exec=shadermon
+Icon=shadermon
+Type=Application
+Categories=Utility;
+Terminal=false
+Comment=Monitor Steam shader compilation progress in the system tray
