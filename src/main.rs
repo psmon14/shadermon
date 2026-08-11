@@ -56,12 +56,12 @@ impl ShaderQueue {
         let now = Instant::now();
         let mut finished = Vec::new();
         self.order.retain(|app_id| {
-            if let Some(p) = self.entries.get(app_id) {
-                if now.duration_since(p.last_seen) > IDLE_TIMEOUT {
-                    finished.push((app_id.clone(), p.app_name.clone()));
-                    self.entries.remove(app_id);
-                    return false;
-                }
+            if let Some(p) = self.entries.get(app_id)
+                && now.duration_since(p.last_seen) > IDLE_TIMEOUT
+            {
+                finished.push((app_id.clone(), p.app_name.clone()));
+                self.entries.remove(app_id);
+                return false;
             }
             true
         });
@@ -128,55 +128,54 @@ fn main() {
             .unwrap_or(0);
 
         loop {
-            if let Ok(mut file) = File::open(&log_path_bg) {
-                if let Ok(metadata) = file.metadata() {
-                    let len = metadata.len();
+            if let Ok(mut file) = File::open(&log_path_bg)
+                && let Ok(metadata) = file.metadata()
+            {
+                let len = metadata.len();
 
-                    if len < last_pos {
-                        last_pos = 0;
-                    }
+                if len < last_pos {
+                    last_pos = 0;
+                }
 
-                    if len > last_pos {
-                        if file.seek(SeekFrom::Start(last_pos)).is_ok() {
-                            let reader = BufReader::new(&file);
-                            for line in reader.lines().map_while(Result::ok) {
-                                if let Some(caps) = progress_re.captures(&line) {
-                                    let app_id = caps.get(1).unwrap().as_str().to_string();
-                                    let percent_raw = caps.get(2).unwrap().as_str();
-                                    let compiled = caps.get(3).unwrap().as_str().to_string();
-                                    let total = caps.get(4).unwrap().as_str().to_string();
+                if len > last_pos {
+                    if file.seek(SeekFrom::Start(last_pos)).is_ok() {
+                        let reader = BufReader::new(&file);
+                        for line in reader.lines().map_while(Result::ok) {
+                            if let Some(caps) = progress_re.captures(&line) {
+                                let app_id = caps.get(1).unwrap().as_str().to_string();
+                                let percent_raw = caps.get(2).unwrap().as_str();
+                                let compiled = caps.get(3).unwrap().as_str().to_string();
+                                let total = caps.get(4).unwrap().as_str().to_string();
+                                let percent_num = percent_raw.parse::<u32>().unwrap_or(0);
+                                let percent_str = format!("{}%", percent_raw);
 
-                                    let percent_num = percent_raw.parse::<u32>().unwrap_or(0);
-                                    let percent_str = format!("{}%", percent_raw);
+                                let app_name = app_cache
+                                    .entry(app_id.clone())
+                                    .or_insert_with(|| resolve_app_name(&steamapps_dirs, &app_id))
+                                    .clone();
 
-                                    let app_name = app_cache
-                                        .entry(app_id.clone())
-                                        .or_insert_with(|| resolve_app_name(&steamapps_dirs, &app_id))
-                                        .clone();
-
-                                    let mut lock = queue_bg.lock().unwrap();
-                                    lock.upsert(
-                                        app_id,
-                                        ShaderProgress {
-                                            app_name,
-                                            percent_num,
-                                            percent_str,
-                                            compiled,
-                                            total,
-                                            last_seen: Instant::now(),
-                                        },
-                                    );
-                                } else if done_re.is_match(&line) {
-                                    let mut lock = queue_bg.lock().unwrap();
-                                    if let Some((_, app_name)) = lock.complete_highest() {
-                                        drop(lock);
-                                        notify_finished(&app_name);
-                                    }
+                                let mut lock = queue_bg.lock().unwrap();
+                                lock.upsert(
+                                    app_id,
+                                    ShaderProgress {
+                                        app_name,
+                                        percent_num,
+                                        percent_str,
+                                        compiled,
+                                        total,
+                                        last_seen: Instant::now(),
+                                    },
+                                );
+                            } else if done_re.is_match(&line) {
+                                let mut lock = queue_bg.lock().unwrap();
+                                if let Some((_, app_name)) = lock.complete_highest() {
+                                    drop(lock);
+                                    notify_finished(&app_name);
                                 }
                             }
                         }
-                        last_pos = len;
                     }
+                    last_pos = len;
                 }
             }
 
@@ -211,7 +210,11 @@ fn main() {
                     let bar = make_progress_bar(progress.percent_num);
                     let text = format!(
                         "{} \n{} {} ( {}/{} )",
-                        progress.app_name, bar, progress.percent_str, progress.compiled, progress.total
+                        progress.app_name,
+                        bar,
+                        progress.percent_str,
+                        progress.compiled,
+                        progress.total
                     );
 
                     if let Some(item) = menu_items.get(app_id) {
@@ -236,11 +239,11 @@ fn main() {
 
     let main_loop_clone = main_loop.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-            if event.id == quit_item.id() {
-                let _ = tray_icon.take();
-                main_loop_clone.quit();
-            }
+        if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv()
+            && event.id == quit_item.id()
+        {
+            let _ = tray_icon.take();
+            main_loop_clone.quit();
         }
 
         glib::ControlFlow::Continue
