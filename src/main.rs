@@ -3,10 +3,10 @@ use notify_rust::Notification;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tray_icon::{
     Icon, TrayIconBuilder,
     menu::{Menu, MenuItem},
@@ -14,14 +14,69 @@ use tray_icon::{
 
 const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
 
-#[derive(Debug, Clone, Default)]
+const IDLE_TIMEOUT: Duration = Duration::from_secs(12);
+
+#[derive(Debug, Clone)]
 struct ShaderProgress {
     app_name: String,
     percent_num: u32,
     percent_str: String,
     compiled: String,
     total: String,
-    is_active: bool,
+    last_seen: Instant,
+}
+
+#[derive(Default)]
+struct ShaderQueue {
+    order: Vec<String>,
+    entries: HashMap<String, ShaderProgress>,
+}
+
+impl ShaderQueue {
+    fn upsert(&mut self, app_id: String, progress: ShaderProgress) {
+        if !self.entries.contains_key(&app_id) {
+            self.order.push(app_id.clone());
+        }
+        self.entries.insert(app_id, progress);
+    }
+
+    fn complete_highest(&mut self) -> Option<(String, String)> {
+        let app_id = self
+            .entries
+            .iter()
+            .max_by_key(|(_, p)| p.percent_num)
+            .map(|(id, _)| id.clone())?;
+
+        let progress = self.entries.remove(&app_id)?;
+        self.order.retain(|id| id != &app_id);
+        Some((app_id, progress.app_name))
+    }
+
+    fn reap_idle(&mut self) -> Vec<(String, String)> {
+        let now = Instant::now();
+        let mut finished = Vec::new();
+        self.order.retain(|app_id| {
+            if let Some(p) = self.entries.get(app_id) {
+                if now.duration_since(p.last_seen) > IDLE_TIMEOUT {
+                    finished.push((app_id.clone(), p.app_name.clone()));
+                    self.entries.remove(app_id);
+                    return false;
+                }
+            }
+            true
+        });
+        finished
+    }
+}
+
+fn notify_finished(app_name: &str) {
+    let _ = Notification::new()
+        .summary("Steam Shader Monitor")
+        .body(&format!("Finished compiling shaders for:\n{}", app_name))
+        .appname("shadermon")
+        .icon("steam") //Should pull steam icon, i think?
+        .timeout(Duration::from_secs(5))
+        .show();
 }
 
 fn main() {
@@ -40,13 +95,13 @@ fn main() {
         steamapps_dirs.extend(extra_dirs);
     }
 
-    let current_progress = Arc::new(Mutex::new(ShaderProgress::default()));
+    let queue = Arc::new(Mutex::new(ShaderQueue::default()));
     let mut app_cache: HashMap<String, String> = HashMap::new();
 
     let tray_menu = Menu::new();
-    let progress_item = MenuItem::new("No shaders compiling", false, None);
+    let placeholder_item = MenuItem::new("No shaders compiling", false, None);
     let quit_item = MenuItem::new("Quit", true, None);
-    let _ = tray_menu.append_items(&[&progress_item, &quit_item]);
+    let _ = tray_menu.append_items(&[&placeholder_item, &quit_item]);
 
     let icon = load_embedded_icon(ICON_BYTES).unwrap_or_else(|| {
         eprintln!("Warning: Failed to decode embedded icon. Falling back to blank canvas.");
@@ -55,109 +110,139 @@ fn main() {
 
     let mut tray_icon = Some(
         TrayIconBuilder::new()
-            .with_menu(Box::new(tray_menu))
+            .with_menu(Box::new(tray_menu.clone()))
             .with_tooltip("Steam Shader Progress")
             .with_icon(icon)
             .build()
             .unwrap(),
     );
 
-    let progress_clone = Arc::clone(&current_progress);
+    let queue_bg = Arc::clone(&queue);
+    let log_path_bg = log_path.clone();
     std::thread::spawn(move || {
         let progress_re = Regex::new(r"Still replaying (\d+)\s+\((\d+)%,\s+(\d+)/(\d+)\)").unwrap();
         let done_re = Regex::new(r"Destroyed compile job (\d+)").unwrap();
-        let mut last_checked_len = 0;
+
+        let mut last_pos: u64 = std::fs::metadata(&log_path_bg)
+            .map(|m| m.len())
+            .unwrap_or(0);
 
         loop {
-            if let Ok(file) = File::open(&log_path)
-                && let Ok(metadata) = file.metadata()
-            {
-                let len = metadata.len();
+            if let Ok(mut file) = File::open(&log_path_bg) {
+                if let Ok(metadata) = file.metadata() {
+                    let len = metadata.len();
 
-                if len != last_checked_len {
-                    last_checked_len = len;
-                    let reader = BufReader::new(file);
+                    if len < last_pos {
+                        last_pos = 0;
+                    }
 
-                    if let Some(last_line) = reader.lines().map_while(Result::ok).last() {
-                        let mut lock = progress_clone.lock().unwrap();
+                    if len > last_pos {
+                        if file.seek(SeekFrom::Start(last_pos)).is_ok() {
+                            let reader = BufReader::new(&file);
+                            for line in reader.lines().map_while(Result::ok) {
+                                if let Some(caps) = progress_re.captures(&line) {
+                                    let app_id = caps.get(1).unwrap().as_str().to_string();
+                                    let percent_raw = caps.get(2).unwrap().as_str();
+                                    let compiled = caps.get(3).unwrap().as_str().to_string();
+                                    let total = caps.get(4).unwrap().as_str().to_string();
 
-                        if let Some(caps) = progress_re.captures(&last_line) {
-                            let app_id = caps.get(1).unwrap().as_str().to_string();
-                            let percent_raw = caps.get(2).unwrap().as_str();
-                            let compiled = caps.get(3).unwrap().as_str().to_string();
-                            let total = caps.get(4).unwrap().as_str().to_string();
+                                    let percent_num = percent_raw.parse::<u32>().unwrap_or(0);
+                                    let percent_str = format!("{}%", percent_raw);
 
-                            let percent_num = percent_raw.parse::<u32>().unwrap_or(0);
-                            let percent_str = format!("{}%", percent_raw);
+                                    let app_name = app_cache
+                                        .entry(app_id.clone())
+                                        .or_insert_with(|| resolve_app_name(&steamapps_dirs, &app_id))
+                                        .clone();
 
-                            let app_name = app_cache
-                                .entry(app_id.clone())
-                                .or_insert_with(|| resolve_app_name(&steamapps_dirs, &app_id))
-                                .clone();
-
-                            *lock = ShaderProgress {
-                                app_name,
-                                percent_num,
-                                percent_str,
-                                compiled,
-                                total,
-                                is_active: true,
-                            };
-                        } else if done_re.captures(&last_line).is_some()
-                            && lock.is_active
-                            && !lock.app_name.is_empty()
-                        {
-                            let _ = Notification::new()
-                                .summary("Steam Shader Monitor")
-                                .body(&format!(
-                                    "Finished compiling shaders for:\n{}",
-                                    lock.app_name
-                                ))
-                                .appname("shadermon")
-                                .icon("steam") //Should pull steam icon, i think?
-                                .timeout(Duration::from_secs(5))
-                                .show();
-
-                            *lock = ShaderProgress {
-                                is_active: false,
-                                ..Default::default()
-                            };
+                                    let mut lock = queue_bg.lock().unwrap();
+                                    lock.upsert(
+                                        app_id,
+                                        ShaderProgress {
+                                            app_name,
+                                            percent_num,
+                                            percent_str,
+                                            compiled,
+                                            total,
+                                            last_seen: Instant::now(),
+                                        },
+                                    );
+                                } else if done_re.is_match(&line) {
+                                    let mut lock = queue_bg.lock().unwrap();
+                                    if let Some((_, app_name)) = lock.complete_highest() {
+                                        drop(lock);
+                                        notify_finished(&app_name);
+                                    }
+                                }
+                            }
                         }
+                        last_pos = len;
                     }
                 }
             }
-            std::thread::sleep(Duration::from_millis(500));
+
+            let stalled = queue_bg.lock().unwrap().reap_idle();
+            for (_, app_name) in stalled {
+                notify_finished(&app_name);
+            }
+
+            std::thread::sleep(Duration::from_millis(300));
         }
     });
 
     let main_loop = glib::MainLoop::new(None, false);
 
-    let progress_ui_clone = Arc::clone(&current_progress);
-    let progress_item_clone = progress_item.clone();
+    let mut menu_items: HashMap<String, MenuItem> = HashMap::new();
+    let tray_menu_ui = tray_menu.clone();
+    let queue_ui = Arc::clone(&queue);
     glib::timeout_add_local(Duration::from_millis(500), move || {
-        if let Ok(data) = progress_ui_clone.lock() {
-            if data.is_active {
-                let bar = make_progress_bar(data.percent_num);
-                let text = format!(
-                    "{} \n{} {} ( {}/{} )",
-                    data.app_name, bar, data.percent_str, data.compiled, data.total
-                );
-                progress_item_clone.set_text(text);
-            } else {
-                progress_item_clone.set_text("No active shader compilation");
+        if let Ok(lock) = queue_ui.lock() {
+            let active_ids: std::collections::HashSet<&String> = lock.order.iter().collect();
+            menu_items.retain(|app_id, item| {
+                if !active_ids.contains(app_id) {
+                    let _ = tray_menu_ui.remove(item);
+                    false
+                } else {
+                    true
+                }
+            });
+
+            for app_id in &lock.order {
+                if let Some(progress) = lock.entries.get(app_id) {
+                    let bar = make_progress_bar(progress.percent_num);
+                    let text = format!(
+                        "{} \n{} {} ( {}/{} )",
+                        progress.app_name, bar, progress.percent_str, progress.compiled, progress.total
+                    );
+
+                    if let Some(item) = menu_items.get(app_id) {
+                        item.set_text(text);
+                    } else {
+                        let item = MenuItem::new(text, false, None);
+                        let _ = tray_menu_ui.insert(&item, menu_items.len());
+                        menu_items.insert(app_id.clone(), item);
+                    }
+                }
             }
+
+            placeholder_item.set_text(if lock.order.is_empty() {
+                "No shaders compiling".to_string()
+            } else {
+                format!("{} app(s) compiling shaders", lock.order.len())
+            });
         }
+
         glib::ControlFlow::Continue
     });
 
     let main_loop_clone = main_loop.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv()
-            && event.id == quit_item.id()
-        {
-            let _ = tray_icon.take();
-            main_loop_clone.quit();
+        if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            if event.id == quit_item.id() {
+                let _ = tray_icon.take();
+                main_loop_clone.quit();
+            }
         }
+
         glib::ControlFlow::Continue
     });
 
@@ -165,9 +250,9 @@ fn main() {
 }
 
 fn make_progress_bar(percent: u32) -> String {
-    let total_blocks = 10;
+    let total_blocks: usize = 10;
     let filled_blocks = ((percent as f32 / 100.0) * total_blocks as f32).round() as usize;
-    let empty_blocks = total_blocks - filled_blocks;
+    let empty_blocks = total_blocks.saturating_sub(filled_blocks);
 
     let filled = "█".repeat(filled_blocks);
     let empty = "░".repeat(empty_blocks);
